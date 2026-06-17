@@ -1,360 +1,231 @@
-const express = require('express');
-const multer  = require('multer');
-const unzipper = require('unzipper');
-const path = require('path');
-const fs   = require('fs');
+const path = require("path");
+const fs = require("fs");
+const express = require("express");
+const multer = require("multer");
+const unzipper = require("unzipper");
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_DIR    = process.env.DATA_DIR || path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
-const META_FILE   = path.join(DATA_DIR, 'meta.json');
 
-// Ensure directories exist
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-fs.mkdirSync(DATA_DIR, { recursive: true });
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
+const TMP_DIR = path.join(DATA_DIR, "tmp");
+const META_FILE = path.join(DATA_DIR, "meta.json");
+for (const d of [DATA_DIR, UPLOADS_DIR, TMP_DIR]) fs.mkdirSync(d, { recursive: true });
 
-app.use(express.json());
+const IMG_RE = /\.(jpe?g|png|webp|gif|avif)$/i;
+const STATUSES = ["Draft", "Approved", "Winner", "Rejected"];
 
-// --- Meta helpers ---
-function readMeta() {
-  try { return JSON.parse(fs.readFileSync(META_FILE, 'utf8')); } catch { return {}; }
+app.use(express.json({ limit: "4mb" }));
+app.use("/uploads", express.static(UPLOADS_DIR));
+app.use(express.static(path.join(__dirname, "public")));
+
+function loadMeta() {
+  try { return JSON.parse(fs.readFileSync(META_FILE, "utf8")); } catch (e) { return {}; }
 }
-function writeMeta(m) {
-  fs.writeFileSync(META_FILE, JSON.stringify(m, null, 2));
+function saveMeta(m) {
+  const tmp = META_FILE + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(m, null, 2));
+  fs.renameSync(tmp, META_FILE);
+}
+function applyEdit(cur, src) {
+  if (src.name !== undefined) cur.name = src.name;
+  if (src.status !== undefined) cur.status = src.status;
+  if (src.notes !== undefined) cur.notes = src.notes;
+  return cur;
 }
 
-// --- Image finder ---
-function findImages(dir) {
-  const exts = ['.jpg','.jpeg','.png','.gif','.webp','.svg'];
-  let results = [];
-  if (!fs.existsSync(dir)) return results;
-  for (const entry of fs.readdirSync(dir)) {
-    const full = path.join(dir, entry);
-    if (fs.statSync(full).isDirectory()) {
-      results = results.concat(findImages(full));
-    } else if (exts.includes(path.extname(entry).toLowerCase())) {
-      results.push(full);
+app.get("/healthz", (_q, r) => r.type("text").send("ok"));
+
+app.get("/api/uploads", (_q, res) => {
+  const items = [];
+  try {
+    for (const run of fs.readdirSync(UPLOADS_DIR, { withFileTypes: true })) {
+      if (!run.isDirectory()) continue;
+      const dir = path.join(UPLOADS_DIR, run.name);
+      for (const f of fs.readdirSync(dir)) {
+        if (IMG_RE.test(f)) {
+          items.push({ key: run.name + "/" + f, run: run.name, file: f, url: "/uploads/" + run.name + "/" + f });
+        }
+      }
     }
+  } catch (e) {}
+  res.json({ items });
+});
+
+app.get("/api/meta", (_q, res) => res.json(loadMeta()));
+
+app.post("/api/meta", (req, res) => {
+  const b = req.body || {};
+  if (!b.key) return res.status(400).json({ error: "key required" });
+  const m = loadMeta();
+  m[b.key] = applyEdit(m[b.key] || {}, b);
+  saveMeta(m);
+  res.json({ ok: true, key: b.key, meta: m[b.key] });
+});
+
+app.post("/api/meta/bulk", (req, res) => {
+  const items = (req.body && req.body.items) || [];
+  if (!Array.isArray(items)) return res.status(400).json({ error: "items array required" });
+  const m = loadMeta();
+  let n = 0;
+  for (const it of items) {
+    if (!it || !it.key) continue;
+    m[it.key] = applyEdit(m[it.key] || {}, it);
+    n++;
   }
-  return results;
-}
+  saveMeta(m);
+  res.json({ ok: true, updated: n });
+});
 
-// --- Upload (multer -> disk -> unzip) ---
-const upload = multer({ dest: path.join(DATA_DIR, 'tmp') });
+app.delete("/api/run/:runId", (req, res) => {
+  const runId = req.params.runId;
+  if (!runId || runId.includes("/") || runId.includes("..") || runId.includes("\\")) {
+    return res.status(400).json({ error: "invalid runId" });
+  }
+  const dir = path.join(UPLOADS_DIR, runId);
+  if (!dir.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(dir)) {
+    return res.status(404).json({ error: "run not found" });
+  }
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    const m = loadMeta();
+    let removed = 0;
+    for (const k of Object.keys(m)) {
+      if (k.startsWith(runId + "/")) { delete m[k]; removed++; }
+    }
+    saveMeta(m);
+    res.json({ ok: true, deleted: runId, meta_entries_removed: removed });
+  } catch (err) {
+    res.status(500).json({ error: "delete failed: " + err.message });
+  }
+});
 
-app.post('/upload', upload.single('zip'), async (req, res) => {
-  const runId = req.body.run_id || ('run-' + Date.now());
-  const runDir = path.join(UPLOADS_DIR, runId);
-  fs.mkdirSync(runDir, { recursive: true });
-
+const upload = multer({ dest: TMP_DIR, limits: { fileSize: 250 * 1024 * 1024 } });
+app.post("/upload", upload.single("zip"), async (req, res) => {
+  if (!req.file) return res.status(400).send("No zip uploaded (form field zip).");
+  const runId = (req.body.run_id || "run-" + Date.now()).replace(/[^a-zA-Z0-9._-]/g, "-");
+  const dest = path.join(UPLOADS_DIR, runId);
+  fs.mkdirSync(dest, { recursive: true });
   try {
     await fs.createReadStream(req.file.path)
-      .pipe(unzipper.Extract({ path: runDir }))
+      .pipe(unzipper.Parse())
+      .on("entry", (entry) => {
+        const base = path.basename(entry.path);
+        if (entry.type === "File" && IMG_RE.test(base) && !base.startsWith(".") && !entry.path.includes("__MACOSX")) {
+          entry.pipe(fs.createWriteStream(path.join(dest, base.replace(/[^a-zA-Z0-9._-]/g, "_"))));
+        } else {
+          entry.autodrain();
+        }
+      })
       .promise();
-    fs.unlinkSync(req.file.path);
-
-    // Remove __MACOSX and .DS_Store
-    const cleanup = (d) => {
-      for (const e of fs.readdirSync(d)) {
-        const f = path.join(d, e);
-        if (e === '__MACOSX' || e === '.DS_Store') { fs.rmSync(f, { recursive: true, force: true }); continue; }
-        if (fs.statSync(f).isDirectory()) cleanup(f);
-      }
-    };
-    cleanup(runDir);
-
-    const images = findImages(runDir);
-    res.json({ ok: true, run_id: runId, count: images.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    fs.unlink(req.file.path, () => {});
+    res.redirect("/");
+  } catch (err) {
+    fs.unlink(req.file.path, () => {});
+    res.status(500).send("Unzip failed: " + err.message);
   }
 });
 
-// --- API: list uploads ---
-app.get('/api/uploads', (req, res) => {
-  const meta = readMeta();
-  if (!fs.existsSync(UPLOADS_DIR)) return res.json({ runs: [], items: [] });
+app.get("/upload", (_q, res) => res.type("html").send(UPLOAD_PAGE));
+app.get("/", (_q, res) => res.type("html").send(DASHBOARD_PAGE));
+app.listen(PORT, () => console.log("assets-dashboard listening on :" + PORT));
 
-  const runs = fs.readdirSync(UPLOADS_DIR).filter(r => {
-    const p = path.join(UPLOADS_DIR, r);
-    return fs.statSync(p).isDirectory();
-  });
+const UPLOAD_PAGE = `<!doctype html><html><head><meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload — Creatives</title> <style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#fafafa;margin:0} .w{max-width:560px;margin:0 auto;padding:32px}a{color:#1f6f54} .card{background:#fff;border:1px solid #e4e4e7;border-radius:14px;padding:22px} input,button{font-size:15px}button{margin-top:14px;background:#1f6f54;color:#fff;border:0;border-radius:8px;padding:10px 18px;cursor:pointer} .drop{border:2px dashed #d4d4d8;border-radius:12px;padding:30px;text-align:center;color:#71717a}</style></head> <body><div class="w"><a href="/">&larr; Dashboard</a><h1>Upload a creative bundle</h1> <div class="card"><form method="post" action="/upload" enctype="multipart/form-data"> <div class="drop">Run name<br><input name="run_id" value="batch" style="margin:8px 0"><br> Zip of images<br><input type="file" name="zip" accept=".zip" required></div> <button type="submit">Upload</button></form></div></div></body></html>`;
 
-  const items = [];
-  for (const run of runs) {
-    const imgs = findImages(path.join(UPLOADS_DIR, run));
-    for (const img of imgs) {
-      const rel = path.relative(UPLOADS_DIR, img);
-      const key = rel.replace(/\\/g, '/');
-      const m = meta[key] || {};
-      items.push({
-        key,
-        run,
-        file: path.basename(img),
-        url: '/uploads/' + key,
-        name: m.name || '',
-        status: m.status || 'draft',
-        notes: m.notes || ''
-      });
-    }
-  }
-  res.json({ runs, items });
-});
-
-// --- API: save single meta ---
-app.post('/api/meta', (req, res) => {
-  const { key, name, status, notes } = req.body;
-  if (!key) return res.status(400).json({ ok: false, error: 'key required' });
-  const meta = readMeta();
-  meta[key] = { ...(meta[key] || {}), name, status, notes };
-  writeMeta(meta);
-  res.json({ ok: true });
-});
-
-// --- API: bulk meta ---
-app.post('/api/meta/bulk', (req, res) => {
-  const { updates } = req.body; // [{key, name, status, notes}]
-  if (!Array.isArray(updates)) return res.status(400).json({ ok: false, error: 'updates must be array' });
-  const meta = readMeta();
-  for (const u of updates) {
-    if (!u.key) continue;
-    meta[u.key] = { ...(meta[u.key] || {}), ...u };
-  }
-  writeMeta(meta);
-  res.json({ ok: true, count: updates.length });
-});
-
-// --- API: delete run ---
-app.delete('/api/run/:runId', (req, res) => {
-  const runDir = path.join(UPLOADS_DIR, req.params.runId);
-  if (!fs.existsSync(runDir)) return res.status(404).json({ ok: false, error: 'run not found' });
-  fs.rmSync(runDir, { recursive: true, force: true });
-  res.json({ ok: true });
-});
-
-// Serve uploaded images
-app.use('/uploads', express.static(UPLOADS_DIR));
-
-// --- Dashboard HTML ---
-app.get('/', (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Assets Dashboard</title>
+const DASHBOARD_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Roofus Creative Dashboard</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f13;color:#e0e0e0;min-height:100vh}
-  header{background:#1a1a24;border-bottom:1px solid #2a2a3a;padding:16px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  header h1{font-size:1.4rem;font-weight:700;color:#fff;flex:1}
-  header input{background:#0f0f18;border:1px solid #333;color:#e0e0e0;padding:8px 12px;border-radius:8px;font-size:.9rem;width:220px}
-  header input:focus{outline:none;border-color:#6c63ff}
-  .filters{display:flex;gap:8px;flex-wrap:wrap}
-  .filter-btn{background:#1e1e2e;border:1px solid #333;color:#aaa;padding:6px 14px;border-radius:20px;cursor:pointer;font-size:.82rem;transition:all .2s}
-  .filter-btn.active,.filter-btn:hover{background:#6c63ff;border-color:#6c63ff;color:#fff}
-  .upload-btn{background:#6c63ff;color:#fff;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:.9rem;font-weight:600;text-decoration:none;white-space:nowrap}
-  .upload-btn:hover{background:#5a52e0}
-  main{padding:24px}
-  .stats{margin-bottom:16px;color:#888;font-size:.85rem}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
-  .card{background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;overflow:hidden;transition:transform .2s,box-shadow .2s}
-  .card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.4)}
-  .card img{width:100%;height:180px;object-fit:cover;display:block;background:#111}
-  .card-body{padding:12px}
-  .card-name{font-size:.88rem;font-weight:600;color:#fff;outline:none;border:1px solid transparent;border-radius:4px;padding:2px 4px;width:100%;background:transparent;cursor:text;word-break:break-word;min-height:20px}
-  .card-name:hover{border-color:#444}
-  .card-name:focus{border-color:#6c63ff;background:#0f0f18}
-  .card-meta{display:flex;align-items:center;gap:8px;margin-top:8px}
-  .status-badge{font-size:.72rem;font-weight:700;padding:3px 10px;border-radius:12px;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;border:none;transition:all .2s}
-  .status-draft{background:#2a2a3a;color:#888}
-  .status-approved{background:#1a3a2a;color:#4ade80}
-  .status-winner{background:#3a2a00;color:#fbbf24}
-  .status-rejected{background:#3a1a1a;color:#f87171}
-  .card-notes{width:100%;background:#0f0f18;border:1px solid #2a2a3a;color:#aaa;border-radius:6px;padding:6px 8px;font-size:.78rem;margin-top:8px;resize:none;height:50px}
-  .card-notes:focus{outline:none;border-color:#6c63ff}
-  .card-run{font-size:.7rem;color:#555;margin-top:6px}
-  .delete-btn{background:none;border:none;color:#555;cursor:pointer;font-size:.75rem;margin-left:auto;padding:2px 6px;border-radius:4px}
-  .delete-btn:hover{color:#f87171;background:#2a1a1a}
-  .empty{text-align:center;padding:80px 20px;color:#555}
-  .empty h2{font-size:1.2rem;margin-bottom:8px}
-  .toast{position:fixed;bottom:24px;right:24px;background:#6c63ff;color:#fff;padding:10px 20px;border-radius:8px;font-size:.88rem;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
-  .toast.show{opacity:1}
-  .upload-page{max-width:500px;margin:60px auto;background:#1a1a24;border:1px solid #2a2a3a;border-radius:16px;padding:32px}
-  .upload-page h2{margin-bottom:24px;font-size:1.3rem}
-  .upload-page input,.upload-page input[type=text]{width:100%;padding:10px 14px;background:#0f0f18;border:1px solid #333;border-radius:8px;color:#e0e0e0;font-size:.9rem;margin-bottom:16px}
-  .upload-page button{background:#6c63ff;color:#fff;border:none;padding:12px 24px;border-radius:8px;cursor:pointer;font-size:1rem;font-weight:600;width:100%}
-  .upload-page button:hover{background:#5a52e0}
-  .upload-page .msg{margin-top:16px;padding:12px;border-radius:8px;font-size:.88rem}
-  .upload-page .msg.ok{background:#1a3a2a;color:#4ade80}
-  .upload-page .msg.err{background:#3a1a1a;color:#f87171}
-</style>
-</head>
-<body>
-<div id="app"></div>
-<div class="toast" id="toast"></div>
+:root{--brand:#1f6f54}
+*{box-sizing:border-box}
+body{margin:0;background:#fafafa;color:#18181b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:24px}
+.eyebrow{color:var(--brand);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin:0}
+h1{margin:4px 0 2px;font-size:28px}
+.sub{color:#71717a;font-size:14px;margin:0}
+.top{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.upbtn{background:var(--brand);color:#fff;border:0;border-radius:8px;padding:9px 14px;font-size:14px;text-decoration:none}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}
+.fbtn{border:1px solid #d4d4d8;background:#fff;border-radius:999px;padding:6px 14px;font-size:14px;cursor:pointer}
+.fbtn.on{background:var(--brand);color:#fff;border-color:var(--brand)}
+.search{border:1px solid #d4d4d8;border-radius:8px;padding:8px 10px;font-size:14px;min-width:220px;flex:1}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+.card{background:#fff;border:1px solid #e4e4e7;border-radius:12px;overflow:hidden}
+.imgwrap{aspect-ratio:1;background:#f4f4f5}
+.imgwrap img{width:100%;height:100%;object-fit:cover;display:block}
+.meta{padding:10px}
+.name{font-size:14px;font-weight:500;color:#27272a;cursor:text;min-height:18px;outline:none;border-radius:4px}
+.name:focus{background:#f4f4f5;box-shadow:0 0 0 2px var(--brand)}
+.run{font-size:11px;color:#a1a1aa;margin:2px 0}
+.badge{display:inline-block;font-size:11px;font-weight:600;padding:3px 10px;border-radius:999px;cursor:pointer;margin-top:6px;user-select:none}
+.b-Draft{background:#f4f4f5;color:#52525b}
+.b-Approved{background:#dcfce7;color:#166534}
+.b-Winner{background:#fef9c3;color:#854d0e}
+.b-Rejected{background:#fee2e2;color:#991b1b}
+.notes{font-size:12px;color:#71717a;cursor:text;margin-top:6px;min-height:16px;outline:none;border-radius:4px}
+.notes:empty:before{content:'+ note';color:#c4c4c8}
+.notes:focus{background:#f4f4f5;box-shadow:0 0 0 2px var(--brand)}
+</style></head><body><div class="wrap">
+<div class="top"><div>
+<p class="eyebrow">Brand Creative Work</p>
+<h1>Roofus Creative Dashboard</h1>
+<p class="sub" id="sub">Loading…</p></div>
+<a class="upbtn" href="/upload">Upload bundle</a></div>
+<div class="filters" id="filters"></div>
+<input class="search" id="q" placeholder="Search name, run, notes…" style="margin-bottom:14px">
+<div class="grid" id="grid"></div>
+</div>
 <script>
-const PAGE = location.pathname;
-
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2500);
+var STATUSES=["Draft","Approved","Winner","Rejected"];
+var ITEMS=[],META={},FILTER="All",Q="";
+function save(key,patch){
+  META[key]=Object.assign({},META[key]||{},patch);
+  fetch("/api/meta",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(Object.assign({key:key},patch))}).catch(function(){});
 }
-
-async function saveMeta(key, name, status, notes) {
-  await fetch('/api/meta', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({key, name, status, notes})
+function nm(it){return (META[it.key]&&META[it.key].name)||it.file.replace(/\.[a-z]+$/i,"");}
+function st(it){return (META[it.key]&&META[it.key].status)||"Draft";}
+function nt(it){return (META[it.key]&&META[it.key].notes)||"";}
+function render(){
+  var counts={All:ITEMS.length};STATUSES.forEach(function(s){counts[s]=0;});
+  ITEMS.forEach(function(it){counts[st(it)]++;});
+  var fb=document.getElementById("filters");fb.innerHTML="";
+  ["All"].concat(STATUSES).forEach(function(s){
+    var b=document.createElement("button");b.className="fbtn"+(FILTER===s?" on":"");
+    b.textContent=s+" ("+(counts[s]||0)+")";b.onclick=function(){FILTER=s;render();};fb.appendChild(b);
   });
-  showToast('Saved');
-}
-
-const STATUS_CYCLE = ['draft','approved','winner','rejected'];
-const STATUS_LABELS = {draft:'Draft',approved:'Approved',winner:'Winner',rejected:'Rejected'};
-
-function nextStatus(s) {
-  const i = STATUS_CYCLE.indexOf(s);
-  return STATUS_CYCLE[(i+1) % STATUS_CYCLE.length];
-}
-
-async function renderDashboard() {
-  const app = document.getElementById('app');
-  const res = await fetch('/api/uploads');
-  const data = await res.json();
-  const items = data.items || [];
-
-  let filter = 'all', search = '';
-
-  function render() {
-    const filtered = items.filter(item => {
-      const matchFilter = filter === 'all' || item.status === filter;
-      const q = search.toLowerCase();
-      const matchSearch = !q || item.name.toLowerCase().includes(q) || item.file.toLowerCase().includes(q) || item.run.toLowerCase().includes(q);
-      return matchFilter && matchSearch;
+  var q=Q.toLowerCase();
+  var list=ITEMS.filter(function(it){
+    if(FILTER!=="All"&&st(it)!==FILTER)return false;
+    if(q){var h=(nm(it)+" "+it.run+" "+nt(it)).toLowerCase();if(h.indexOf(q)<0)return false;}
+    return true;
+  });
+  document.getElementById("sub").textContent=list.length+" of "+ITEMS.length+" creatives";
+  var g=document.getElementById("grid");g.innerHTML="";
+  list.forEach(function(it){
+    var c=document.createElement("div");c.className="card";
+    var s=st(it);
+    c.innerHTML='<div class="imgwrap"><img loading="lazy" src="'+it.url+'"></div>'+
+      '<div class="meta">'+
+      '<div class="name" contenteditable="true" spellcheck="false"></div>'+
+      '<div class="run">'+it.run+'</div>'+
+      '<span class="badge b-'+s+'">'+s+'</span>'+
+      '<div class="notes" contenteditable="true" spellcheck="false"></div>'+
+      '</div>';
+    var nameEl=c.querySelector(".name");nameEl.textContent=nm(it);
+    nameEl.addEventListener("blur",function(){var v=nameEl.textContent.trim();save(it.key,{name:v});});
+    var notesEl=c.querySelector(".notes");notesEl.textContent=nt(it);
+    notesEl.addEventListener("blur",function(){save(it.key,{notes:notesEl.textContent.trim()});});
+    var badge=c.querySelector(".badge");
+    badge.addEventListener("click",function(){
+      var cur=st(it);var next=STATUSES[(STATUSES.indexOf(cur)+1)%STATUSES.length];
+      save(it.key,{status:next});badge.className="badge b-"+next;badge.textContent=next;render();
     });
-
-    app.innerHTML = \`
-    <header>
-      <h1>Assets Dashboard</h1>
-      <input type="search" id="searchBox" placeholder="Search..." value="\${search}">
-      <div class="filters">
-        <button class="filter-btn \${filter==='all'?'active':''}" data-f="all">All (\${items.length})</button>
-        <button class="filter-btn \${filter==='draft'?'active':''}" data-f="draft">Draft</button>
-        <button class="filter-btn \${filter==='approved'?'active':''}" data-f="approved">Approved</button>
-        <button class="filter-btn \${filter==='winner'?'active':''}" data-f="winner">Winner</button>
-        <button class="filter-btn \${filter==='rejected'?'active':''}" data-f="rejected">Rejected</button>
-      </div>
-      <a class="upload-btn" href="/upload">+ Upload</a>
-    </header>
-    <main>
-      <div class="stats">\${filtered.length} of \${items.length} creatives | \${data.runs?.length||0} runs</div>
-      \${filtered.length === 0 ? '<div class="empty"><h2>No creatives yet</h2><p>Upload a zip to get started</p></div>' : ''}
-      <div class="grid">
-        \${filtered.map(item => \`
-        <div class="card" data-key="\${item.key}">
-          <img src="\${item.url}" loading="lazy" alt="\${item.file}">
-          <div class="card-body">
-            <div class="card-name" contenteditable="true" data-key="\${item.key}" title="Click to rename">\${item.name || item.file}</div>
-            <div class="card-meta">
-              <button class="status-badge status-\${item.status}" data-key="\${item.key}" data-status="\${item.status}">\${STATUS_LABELS[item.status]||item.status}</button>
-              <button class="delete-btn" data-run="\${item.run}" title="Delete run">x</button>
-            </div>
-            <textarea class="card-notes" data-key="\${item.key}" placeholder="Notes...">\${item.notes||''}</textarea>
-            <div class="card-run">\${item.run}</div>
-          </div>
-        </div>\`).join('')}
-      </div>
-    </main>\`;
-
-    document.getElementById('searchBox').addEventListener('input', e => { search = e.target.value; render(); });
-    document.querySelectorAll('.filter-btn').forEach(btn => btn.addEventListener('click', () => { filter = btn.dataset.f; render(); }));
-
-    document.querySelectorAll('.card-name').forEach(el => {
-      el.addEventListener('blur', () => {
-        const key = el.dataset.key;
-        const item = items.find(i => i.key === key);
-        if (!item) return;
-        item.name = el.textContent.trim();
-        saveMeta(key, item.name, item.status, item.notes);
-      });
-    });
-
-    document.querySelectorAll('.status-badge').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const key = btn.dataset.key;
-        const item = items.find(i => i.key === key);
-        if (!item) return;
-        item.status = nextStatus(item.status);
-        saveMeta(key, item.name, item.status, item.notes);
-        render();
-      });
-    });
-
-    document.querySelectorAll('.card-notes').forEach(ta => {
-      ta.addEventListener('change', () => {
-        const key = ta.dataset.key;
-        const item = items.find(i => i.key === key);
-        if (!item) return;
-        item.notes = ta.value;
-        saveMeta(key, item.name, item.status, item.notes);
-      });
-    });
-
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        if (!confirm('Delete run "' + btn.dataset.run + '" and all its images?')) return;
-        await fetch('/api/run/' + btn.dataset.run, { method: 'DELETE' });
-        items.splice(0);
-        const r2 = await fetch('/api/uploads');
-        const d2 = await r2.json();
-        items.push(...(d2.items||[]));
-        showToast('Run deleted');
-        render();
-      });
-    });
-  }
-
-  render();
-}
-
-async function renderUpload() {
-  document.getElementById('app').innerHTML = \`
-    <header><h1>Assets Dashboard</h1><a class="upload-btn" href="/">Back</a></header>
-    <div class="upload-page">
-      <h2>Upload Images</h2>
-      <input type="text" id="runId" placeholder="Run ID (e.g. 2026-06-18-001-batch)" />
-      <input type="file" id="zipFile" accept=".zip" />
-      <button id="uploadBtn">Upload ZIP</button>
-      <div id="uploadMsg"></div>
-    </div>\`;
-
-  document.getElementById('uploadBtn').addEventListener('click', async () => {
-    const runId = document.getElementById('runId').value.trim();
-    const file = document.getElementById('zipFile').files[0];
-    const msg = document.getElementById('uploadMsg');
-    if (!file) { msg.className='msg err'; msg.textContent='Select a zip file'; return; }
-    msg.className=''; msg.textContent='Uploading...';
-    const fd = new FormData();
-    if (runId) fd.append('run_id', runId);
-    fd.append('zip', file);
-    try {
-      const r = await fetch('/upload', { method:'POST', body: fd });
-      const d = await r.json();
-      if (d.ok) { msg.className='msg ok'; msg.textContent = d.count + ' images uploaded to run: ' + d.run_id; }
-      else { msg.className='msg err'; msg.textContent = d.error; }
-    } catch(e) { msg.className='msg err'; msg.textContent = e.message; }
+    g.appendChild(c);
   });
 }
-
-if (PAGE === '/upload') renderUpload();
-else renderDashboard();
-</script>
-</body>
-</html>`);
-});
-
-app.get('/upload', (req, res) => res.redirect('/'));
-
-app.listen(PORT, () => console.log('Assets Dashboard on port', PORT));
+document.getElementById("q").addEventListener("input",function(e){Q=e.target.value;render();});
+Promise.all([fetch("/api/uploads").then(function(r){return r.json();}),
+             fetch("/api/meta").then(function(r){return r.json();})])
+.then(function(res){ITEMS=(res[0].items||[]).sort(function(a,b){return a.key<b.key?-1:1;});META=res[1]||{};render();});
+</script></body></html>`;
